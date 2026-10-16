@@ -407,59 +407,119 @@ def screen_stock(symbol):
 # -----------------------------
 # User interface
 # -----------------------------
-mode = st.radio(
-    "選擇股票範圍",
-    [
-        "S&P 500 + Nasdaq-100",
-        "自行輸入股票"
-    ],
-    horizontal=True
-)
 
-symbols = []
+# -----------------------------
+# Automatic universe + screening
+# -----------------------------
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_large_cap_universe():
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
 
-if mode == "S&P 500 + Nasdaq-100":
-    if st.button("載入股票名單"):
-        universe = get_universe()
+    urls = [
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        "https://en.wikipedia.org/wiki/Nasdaq-100"
+    ]
 
-        if universe:
-            st.session_state["universe"] = universe
-        else:
-            st.error(
-                "無法載入成分股名單。請檢查網絡，"
-                "或改用自行輸入股票模式。"
+    symbols = set()
+    errors = []
+
+    for url in urls:
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=20
+            )
+            response.raise_for_status()
+
+            tables = pd.read_html(StringIO(response.text))
+            found = False
+
+            for table in tables:
+                for col in table.columns:
+                    col_name = str(col).strip().lower()
+
+                    if col_name in [
+                        "symbol",
+                        "ticker",
+                        "ticker symbol"
+                    ]:
+                        symbols.update(
+                            table[col]
+                            .dropna()
+                            .astype(str)
+                            .str.strip()
+                            .str.replace(".", "-", regex=False)
+                        )
+                        found = True
+                        break
+
+                if found:
+                    break
+
+            if not found:
+                errors.append(f"無法解析成分股：{url}")
+
+        except Exception as exc:
+            errors.append(
+                f"{url}: {type(exc).__name__}"
             )
 
-    symbols = st.session_state.get("universe", [])
-
-    if symbols:
-        st.write(f"名單包含 {len(symbols)} 個股票代號")
-else:
-    raw = st.text_area(
-        "輸入股票代號，以逗號、空格或換行分隔",
-        value="NVDA, MSFT, META, AMZN, GOOGL, AVGO",
-        height=120
+    symbols = sorted(
+        s for s in symbols
+        if s
+        and s.isascii()
+        and " " not in s
+        and "/" not in s
     )
 
-    symbols = sorted(set(
-        s.strip().upper()
-        for s in raw.replace(",", " ").split()
-        if s.strip()
-    ))
+    return symbols, errors
 
-if st.button(
-    "開始嚴格篩選",
-    type="primary",
-    disabled=not symbols
-):
+
+st.subheader("大型股自動掃描")
+
+st.write(
+    "股票池：S&P 500 + Nasdaq-100。"
+    "自動合併重複成分股，再以市值及全部盈利條件嚴格淘汰。"
+)
+
+if st.button("🔄 更新成分股名單"):
+    get_large_cap_universe.clear()
+
+symbols, universe_errors = get_large_cap_universe()
+
+if universe_errors:
+    st.warning(
+        "部分成分股來源載入失敗。"
+        "請檢查網絡及來源頁面，避免把不完整名單當成完整名單。"
+    )
+    for err in universe_errors:
+        st.caption(err)
+
+if not symbols:
+    st.error(
+        "無法取得有效股票名單，已停止掃描。"
+        "不會以不完整名單冒充完整結果。"
+    )
+    st.stop()
+
+st.metric("已載入的去重股票數", len(symbols))
+
+st.info(
+    "成分股名單每日快取 24 小時。"
+    "掃描時仍會獨立核實每家公司市值是否達到 100 億美元。"
+)
+
+if st.button("▶ 開始全自動嚴格篩選", type="primary"):
     rows = []
-
     progress = st.progress(0)
     status = st.empty()
 
     for i, symbol in enumerate(symbols):
         status.write(
-            f"檢查 {symbol}（{i + 1}/{len(symbols)}）"
+            f"正在檢查 {symbol}（{i + 1}/{len(symbols)}）"
         )
 
         rows.append(screen_stock(symbol))
@@ -468,8 +528,9 @@ if st.button(
     df = pd.DataFrame(rows)
     st.session_state["screen_results"] = df
 
-    status.write("掃描完成。")
+    status.success("全股票池掃描完成。")
 
+# Display results
 if "screen_results" in st.session_state:
     df = st.session_state["screen_results"]
 
@@ -477,52 +538,35 @@ if "screen_results" in st.session_state:
     failed = df[df["Status"] != "PASS"].copy()
 
     c1, c2, c3 = st.columns(3)
-
-    c1.metric("掃描股票", len(df))
+    c1.metric("已掃描", len(df))
     c2.metric("全部條件通過", len(passed))
     c3.metric(
-        "淘汰比例",
-        f"{(len(failed) / len(df) * 100):.1f}%"
-        if len(df) else "—"
+        "未通過",
+        len(failed)
     )
 
-    st.subheader("✅ 全部條件通過的股票")
+    st.subheader("符合所有硬性條件的股票")
 
     if passed.empty:
-        st.info(
-            "目前沒有股票通過所有已實施條件。"
-            "不會降低門檻或推薦不合格股票。"
+        st.warning(
+            "沒有股票通過全部條件。"
+            "維持原有標準，不降低門檻。"
         )
     else:
-        display_cols = [
-            "Ticker", "Company", "Market Cap ($B)",
-            "3Y Net Income Growth (%)",
-            "Revenue YoY (%)", "EPS YoY (%)",
-            "Net Income YoY (%)",
-            "Operating Margin Change (pp)",
-            "Latest Quarter"
-        ]
-
-        available_cols = [
-            c for c in display_cols if c in passed.columns
-        ]
-
         st.dataframe(
-            passed[available_cols],
+            passed,
             use_container_width=True,
             hide_index=True
         )
 
         st.download_button(
             "下載合格股票 CSV",
-            data=passed.to_csv(
-                index=False
-            ).encode("utf-8-sig"),
-            file_name="strict_earnings_growth_pass.csv",
-            mime="text/csv"
+            passed.to_csv(index=False).encode("utf-8-sig"),
+            "strict_pass.csv",
+            "text/csv"
         )
 
-    with st.expander("查看淘汰股票及原因"):
+    with st.expander("查看所有淘汰原因"):
         st.dataframe(
             failed,
             use_container_width=True,
@@ -531,14 +575,7 @@ if "screen_results" in st.session_state:
 
         st.download_button(
             "下載完整掃描報告",
-            data=df.to_csv(
-                index=False
-            ).encode("utf-8-sig"),
-            file_name="strict_earnings_growth_all.csv",
-            mime="text/csv"
+            df.to_csv(index=False).encode("utf-8-sig"),
+            "strict_all_results.csv",
+            "text/csv"
         )
-
-st.caption(
-    "研究用途，不構成投資建議。PASS 只表示通過本程式已實施的規則，"
-    "不代表已完成 SEC 原始財報核對、一次性收益審查或審計。"
-)
